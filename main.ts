@@ -57,9 +57,12 @@ function readTask(file: string): any {
 
 // Weight of the game now at rank r for place k: a wide two-sided kernel, since this chart moves a
 // median of 6 of its top 10 places between reads a few hours apart.
+// Lower places churn more than #1, so the near part widens with the place; games above the place
+// (falling into it) count a little more than games below it (climbing into it).
 function kernel(k: number, r: number): number {
-  const d = Math.abs(r - k);
-  const near = Math.exp(-d / 2.5);
+  const d = r - k;
+  const width = 1.8 + 0.25 * k;
+  const near = Math.exp(-Math.abs(d) / (d < 0 ? width * 1.15 : width));
   const far = 0.6 / (4 + r);
   return near + far;
 }
