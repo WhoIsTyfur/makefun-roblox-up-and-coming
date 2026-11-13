@@ -34,9 +34,13 @@ The program is deterministic: the same history gives the same bytes.
   only on games that join the chart later.
 - Each game drifts in rank as the lag grows: up when it climbed over the last day or its player
   count grew faster than its rank says, down the longer it has been on the chart.
+- The forecast is an equal mixture over five lookbacks (6, 12, 24, 48 and 72 hours) of those
+  climb and growth signals, so no one time scale is trusted alone.
 - The near hours are sharpened more than the far ones (the chart rarely moves far in a few hours).
-- When the history carries a game's created date, it is taken off the chart from the hour it
-  turns 28 days old, and its share goes to the others.
+- When the history carries a game's created date, its share is halved from the hour it turns 28
+  days old (the chart counts from publishing, which can come after creation: about half the
+  games near day 28 by their created date stay on), unless the chart has already shown it there
+  past day 28.
 - Every change was judged on 36 cuts of the public archive github.com/Kenny-Dhub/roblox-snapshots,
   scored like the bounty on the reads in the 72 hours after each cut: on the mean, the worst cut,
   and the hours past the first day.
