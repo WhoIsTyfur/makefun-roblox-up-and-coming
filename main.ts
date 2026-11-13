@@ -41,6 +41,7 @@ export const DEFAULTS = {
   // momentum: rising games act as if ranked higher
   beta: 0.9,
   lookH: 24,
+  lookSet: [6, 12, 24, 48, 72] as number[], // when set, an equal mixture over these lookbacks
   // effective rank also leans toward the rank by playing count and by its growth
   gPlay: 0.0,
   gGrow: 0.4,
@@ -296,7 +297,6 @@ export function forecast(reads: Read[], task: Task, P: Params = DEFAULTS): Forec
   const last = reads[reads.length - 1];
   const table = fitTable(reads, task, P);
   const games = last.rows.slice(0, MAX_ROWS);
-  const past = P.beta !== 0 ? pastRanks(reads, P.lookH) : null;
   // latest known created date per game, from any read
   const created = new Map<number, number>();
   for (const r of reads) if (r.created) for (const [id, t] of r.created) created.set(id, t);
@@ -309,9 +309,16 @@ export function forecast(reads: Read[], task: Task, P: Params = DEFAULTS): Forec
     for (let s = 0; s < task.slots; s++) if (task.from + s * task.slotMs < exit) n++;
     return n / task.slots;
   });
-  // rank of each game by its playing count now, and by the growth of it over lookH
   const byPlay = rankBy(games.map((g) => (g.playing ?? 0)));
-  const pastPlay = pastPlaying(reads, P.lookH);
+  const hasPlay = games.some((x) => x.playing !== null);
+  // hours since each game was first seen on the chart (games there from the history's start: its span)
+  const firstSeen = new Map<number, number>();
+  for (const r of reads) for (const g of r.rows) if (!firstSeen.has(g.id)) firstSeen.set(g.id, r.at);
+  // the place-by-game grid for one lookback of the momentum and growth signals
+  const gridFor = (lookH: number): number[][] => {
+  const past = P.beta !== 0 ? pastRanks(reads, lookH) : null;
+  // rank of each game by the growth of its playing count over lookH
+  const pastPlay = pastPlaying(reads, lookH);
   const byGrow = rankBy(
     games.map((g) => {
       const before = pastPlay ? pastPlay.get(g.id) : undefined;
@@ -319,11 +326,7 @@ export function forecast(reads: Read[], task: Task, P: Params = DEFAULTS): Forec
       return before === undefined ? Math.log1p(now) * 0.5 : Math.log1p(now) - Math.log1p(before);
     }),
   );
-  // hours since each game was first seen on the chart (games there from the history's start: its span)
-  const firstSeen = new Map<number, number>();
-  for (const r of reads) for (const g of r.rows) if (!firstSeen.has(g.id)) firstSeen.set(g.id, r.at);
   // the log-rank each game drifts toward: momentum, playing count, playing growth, chart age
-  const hasPlay = games.some((x) => x.playing !== null);
   const drift = games.map((g, i) => {
     let d = 0;
     if (P.gAge !== 0) {
@@ -374,6 +377,15 @@ export function forecast(reads: Read[], task: Task, P: Params = DEFAULTS): Forec
     const total = w.reduce((a, b) => a + b, 0);
     if (total + absent > 1) w = w.map((v) => v / (total + absent));
     grid.push(w);
+  }
+  return grid;
+  };
+  // an equal mixture over several lookbacks: no one time scale of growth is trusted alone
+  const looks = P.lookSet.length > 0 ? P.lookSet : [P.lookH];
+  const grids = looks.map((lh) => gridFor(lh));
+  const grid = grids[0].map((row, k) => row.map((_, i) => grids.reduce((a, g) => a + g[k][i], 0) / grids.length));
+  for (let k = 1; k <= grid.length; k++) {
+    const w = grid[k - 1];
     for (let i = 0; i < games.length; i++) {
       const p = Math.floor(w[i] * 1e8) / 1e8;
       if (p < P.pMin) continue;
