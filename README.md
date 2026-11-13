@@ -24,6 +24,17 @@ for each game it names being at that place, plus its best guess at the top 10 in
 
 The program is deterministic: the same history gives the same bytes.
 
+## The model
+
+- For each place k it estimates, from pairs of reads in the history whose lag matches the window's
+  lags, how much of the window place k is held by a game now at each rank, or by a game not on the
+  chart yet. A wide kernel over rank is the prior that keeps the table smooth.
+- Every game on the last chart is named at every place with its share, so the unnamed mass falls
+  only on games that join the chart later.
+- A game that climbed in the last hours counts as if ranked a little higher; one that fell, lower.
+- When the history carries a game's created date, its share shrinks with the part of the window
+  after it turns 28 days old and leaves the chart.
+
 ## How it is scored
 
 The one forecast is scored against every hourly read of the chart in the 72-hour window. At each read
