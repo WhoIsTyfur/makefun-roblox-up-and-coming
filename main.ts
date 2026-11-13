@@ -52,6 +52,9 @@ export const DEFAULTS = {
   dDown: 1.2,
   fPow: 2, // shape of the drift's onset: (lag / (lag + tauH)) ^ fPow
   tauH: 12, // the drift reaches half its size at this lag (0: whole from the start)
+  // share a game loses once past its created date + 28 days: on 2026-11-13 about half the games
+  // near day 28 by created stayed on the chart past it (published later than created)
+  exitTrust: 0.5,
   temp: 1.1, // per-lag sharpening: temp + tempE * exp(-lag / tempTauH)
   tempE: 1.0,
   tempTauH: 12,
@@ -300,6 +303,14 @@ export function forecast(reads: Read[], task: Task, P: Params = DEFAULTS): Forec
   // latest known created date per game, from any read
   const created = new Map<number, number>();
   for (const r of reads) if (r.created) for (const [id, t] of r.created) created.set(id, t);
+  // a game seen on the chart after its created date + 28 days was published later than created:
+  // its created date says nothing about when it leaves
+  for (const r of reads) {
+    for (const g of r.rows) {
+      const c = created.get(g.id);
+      if (c !== undefined && r.at > c + 28 * DAY + HOUR) created.delete(g.id);
+    }
+  }
   // fraction of the window's slots each game is still young enough to be on the chart
   const alive = games.map((g) => {
     const c = created.get(g.id);
@@ -358,7 +369,7 @@ export function forecast(reads: Read[], task: Task, P: Params = DEFAULTS): Forec
       // a game past day 28 at this slot is off the chart: its mass goes to everyone else, pro rata
       const slotAt = task.from + s * task.slotMs;
       const before = baseSum + t.absent[k - 1];
-      w = w.map((v, i) => (alive[i] < 1 && exitAt(created, games[i].id) <= slotAt ? 0 : v));
+      w = w.map((v, i) => (alive[i] < 1 && exitAt(created, games[i].id) <= slotAt ? v * (1 - P.exitTrust) : v));
       // sharpen the near lags more than the far ones, keeping the named total
       const tp = P.temp + P.tempE * Math.exp(-Math.max(0, t.lag) / P.tempTauH);
       if (tp !== 1) {
