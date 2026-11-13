@@ -23,12 +23,15 @@ export type Task = { from: number; until: number; slots: number; slotMs: number;
 
 export const DEFAULTS = {
   // prior kernel
-  kWidth0: 1.8,
+  kWidth0: 1.0,
   kWidthK: 0.25,
   kAbove: 1.15,
   kFar: 1.2,
-  u0: 0.12,
+  u0: 0.06,
   u0K: 0.01,
+  kLagW: 0.5, // per 24 h of lag: widening of the near part, growth of the far tail, extra unnamed
+  kLagF: 0,
+  uLag: 0.04,
   // fitted table
   alpha: 100, // prior strength, in pairs of reads
   bucketH: 6, // lag bucket width
@@ -45,8 +48,12 @@ export const DEFAULTS = {
   ageH0: 24,
   ageMid: 96,
   dUp: 9, // largest climb and fall the drift may give, in log-rank
-  dDown: 0.7,
-  tauH: 24, // the drift reaches half its size at this lag (0: whole from the start)
+  dDown: 1.2,
+  fPow: 2, // shape of the drift's onset: (lag / (lag + tauH)) ^ fPow
+  tauH: 12, // the drift reaches half its size at this lag (0: whole from the start)
+  temp: 1.1, // per-lag sharpening: temp + tempE * exp(-lag / tempTauH)
+  tempE: 1.0,
+  tempTauH: 12,
   // smallest row worth writing
   pMin: 1e-6,
 };
@@ -115,20 +122,22 @@ export function parseTask(doc: any, reads: Read[]): Task {
   return { from, until, slots, slotMs, places };
 }
 
-function priorKernel(P: Params, k: number, r: number): number {
+// the prior widens and leaves more unnamed as the lag grows: x = lag / 24 h
+function priorKernel(P: Params, k: number, r: number, x: number): number {
   const d = r - k;
-  const width = P.kWidth0 + P.kWidthK * k;
+  const width = (P.kWidth0 + P.kWidthK * k) * (1 + P.kLagW * x);
   const near = Math.exp(-Math.abs(d) / (d < 0 ? width * P.kAbove : width));
-  return near + P.kFar / (4 + r);
+  return near + (P.kFar * (1 + P.kLagF * x)) / (4 + r);
 }
 
 // prior per-game share of place k for a game at each rank 1..RANK_CAP, and the prior unnamed mass
-function priorShares(P: Params, k: number, chartLen: number): { share: number[]; absent: number } {
-  const absent = Math.min(0.6, P.u0 + P.u0K * k);
+function priorShares(P: Params, k: number, chartLen: number, lag: number): { share: number[]; absent: number } {
+  const x = Math.max(0, lag) / 24;
+  const absent = Math.min(0.6, P.u0 + P.u0K * k + P.uLag * x);
   const w: number[] = [];
   let tot = 0;
   for (let r = 1; r <= RANK_CAP; r++) {
-    const v = r <= chartLen ? priorKernel(P, k, r) : 0;
+    const v = r <= chartLen ? priorKernel(P, k, r, x) : 0;
     w.push(v);
     tot += v;
   }
@@ -186,20 +195,24 @@ export function fitTable(reads: Read[], task: Task, P: Params): Table[] {
     }
   }
   const chartLen = last.rows.length;
-  const priors = [];
-  for (let k = 1; k <= places; k++) {
-    const pr = priorShares(P, k, chartLen);
-    const prBin = new Array(NB).fill(0);
-    const prN = new Array(NB).fill(0);
-    for (let r = 1; r <= RANK_CAP; r++) {
-      prBin[binOf(r)] += pr.share[r - 1];
-      prN[binOf(r)] += 1;
+  const priorAt = (lag: number) => {
+    const priors = [];
+    for (let k = 1; k <= places; k++) {
+      const pr = priorShares(P, k, chartLen, lag);
+      const prBin = new Array(NB).fill(0);
+      const prN = new Array(NB).fill(0);
+      for (let r = 1; r <= RANK_CAP; r++) {
+        prBin[binOf(r)] += pr.share[r - 1];
+        prN[binOf(r)] += 1;
+      }
+      for (let b = 0; b < NB; b++) prBin[b] /= prN[b];
+      priors.push({ bin: prBin, absent: pr.absent });
     }
-    for (let b = 0; b < NB; b++) prBin[b] /= prN[b];
-    priors.push({ bin: prBin, absent: pr.absent });
-  }
+    return priors;
+  };
   const tables: Table[] = [];
   for (const lag of lags) {
+    const priors = priorAt(lag);
     let b = Math.max(0, Math.floor(lag / P.bucketH));
     if (b >= nBuckets) b = nBuckets - 1;
     // fall back to the nearest shorter bucket with data
@@ -333,7 +346,7 @@ export function forecast(reads: Read[], task: Task, P: Params = DEFAULTS): Forec
       const t = table[s];
       const sh = t.share[k - 1];
       // the drift takes hold as the lag grows
-      const f = P.tauH > 0 ? Math.max(0, t.lag) / (Math.max(0, t.lag) + P.tauH) : 1;
+      const f = P.tauH > 0 ? Math.pow(Math.max(0, t.lag) / (Math.max(0, t.lag) + P.tauH), P.fPow) : 1;
       const base = games.map((g) => shareAt(sh, g.rank));
       const baseSum = base.reduce((a, b) => a + b, 0);
       let w = games.map((g, i) => shareAt(sh, Math.max(1, g.rank * Math.exp(f * drift[i]))));
@@ -343,6 +356,14 @@ export function forecast(reads: Read[], task: Task, P: Params = DEFAULTS): Forec
       const slotAt = task.from + s * task.slotMs;
       const before = baseSum + t.absent[k - 1];
       w = w.map((v, i) => (alive[i] < 1 && exitAt(created, games[i].id) <= slotAt ? 0 : v));
+      // sharpen the near lags more than the far ones, keeping the named total
+      const tp = P.temp + P.tempE * Math.exp(-Math.max(0, t.lag) / P.tempTauH);
+      if (tp !== 1) {
+        const s0 = w.reduce((a, b) => a + b, 0);
+        const tw = w.map((v) => Math.pow(v, tp));
+        const s1 = tw.reduce((a, b) => a + b, 0);
+        if (s1 > 0) w = tw.map((v) => (v * s0) / s1);
+      }
       const after = w.reduce((a, b) => a + b, 0) + t.absent[k - 1];
       const scale = after > 0 ? before / after : 1;
       for (let i = 0; i < games.length; i++) acc[i] += w[i] * scale;

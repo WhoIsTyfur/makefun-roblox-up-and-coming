@@ -26,14 +26,20 @@ The program is deterministic: the same history gives the same bytes.
 
 ## The model
 
-- For each place k it estimates, from pairs of reads in the history whose lag matches the window's
-  lags, how much of the window place k is held by a game now at each rank, or by a game not on the
-  chart yet. A wide kernel over rank is the prior that keeps the table smooth.
+- For each place k and each of the window's 72 lags it estimates, from pairs of reads in the
+  history with about that lag, how likely place k is held by a game now at each rank, or by a game
+  not on the chart yet. A kernel over rank that widens with the lag is the prior that keeps the
+  table smooth; dense hourly reads are weighted down so they count like the sparse archive's.
 - Every game on the last chart is named at every place with its share, so the unnamed mass falls
   only on games that join the chart later.
-- A game that climbed in the last hours counts as if ranked a little higher; one that fell, lower.
-- When the history carries a game's created date, its share shrinks with the part of the window
-  after it turns 28 days old and leaves the chart.
+- Each game drifts in rank as the lag grows: up when it climbed over the last day or its player
+  count grew faster than its rank says, down the longer it has been on the chart.
+- The near hours are sharpened more than the far ones (the chart rarely moves far in a few hours).
+- When the history carries a game's created date, it is taken off the chart from the hour it
+  turns 28 days old, and its share goes to the others.
+- Every change was judged on 36 cuts of the public archive github.com/Kenny-Dhub/roblox-snapshots,
+  scored like the bounty on the reads in the 72 hours after each cut: on the mean, the worst cut,
+  and the hours past the first day.
 
 ## How it is scored
 
