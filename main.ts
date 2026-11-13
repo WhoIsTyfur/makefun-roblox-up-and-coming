@@ -33,9 +33,20 @@ export const DEFAULTS = {
   alpha: 100, // prior strength, in pairs of reads
   bucketH: 6, // lag bucket width
   halfLifeH: 120, // recency of the later read of a pair, relative to the cut
+  densityH: 6, // a read counts whole only when it follows the one before by this much
+  absMul: 1, // scale on the fitted unnamed mass
   // momentum: rising games act as if ranked higher
-  beta: 0.6,
-  lookH: 12,
+  beta: 0.9,
+  lookH: 24,
+  // effective rank also leans toward the rank by playing count and by its growth
+  gPlay: 0.0,
+  gGrow: 0.4,
+  gAge: 0.6, // older chart entries drift down, new ones up
+  ageH0: 24,
+  ageMid: 96,
+  dUp: 9, // largest climb and fall the drift may give, in log-rank
+  dDown: 0.7,
+  tauH: 24, // the drift reaches half its size at this lag (0: whole from the start)
   // smallest row worth writing
   pMin: 1e-6,
 };
@@ -131,8 +142,9 @@ function windowLags(task: Task, lastAt: number): number[] {
   return lags;
 }
 
-// Fitted table: share[k][bin] (per game in the bin) and absent[k], averaged over the window lags.
-export function fitTable(reads: Read[], task: Task, P: Params): { share: number[][]; absent: number[] } {
+// Fitted table, one per window lag: share[k][bin] (per game in the bin) and absent[k].
+export type Table = { lag: number; share: number[][]; absent: number[] };
+export function fitTable(reads: Read[], task: Task, P: Params): Table[] {
   const places = task.places;
   const last = reads[reads.length - 1];
   const lags = windowLags(task, last.at);
@@ -151,12 +163,16 @@ export function fitTable(reads: Read[], task: Task, P: Params): { share: number[
     for (const g of r.rows) if (g.rank <= RANK_CAP) c[binOf(g.rank)] += 1;
     return c;
   });
+  // a read stands for the time since the one before it, up to densityH: hourly reads must not
+  // outweigh the archive's sparse ones, nor the prior, just by being many
+  const dens = reads.map((r, i) => (i === 0 ? 1 : Math.min(1, (r.at - reads[i - 1].at) / HOUR / P.densityH)));
   for (let j = 1; j < reads.length; j++) {
-    const rw = Math.pow(0.5, (last.at - reads[j].at) / HOUR / P.halfLifeH);
+    const rwj = Math.pow(0.5, (last.at - reads[j].at) / HOUR / P.halfLifeH) * dens[j];
     for (let i = 0; i < j; i++) {
       const lag = (reads[j].at - reads[i].at) / HOUR;
       const b = Math.floor(lag / P.bucketH);
       if (b >= nBuckets) continue;
+      const rw = rwj * dens[i];
       tot[b] += rw;
       const rowsJ = reads[j].rows;
       for (let k = 1; k <= places && k <= rowsJ.length; k++) {
@@ -170,8 +186,7 @@ export function fitTable(reads: Read[], task: Task, P: Params): { share: number[
     }
   }
   const chartLen = last.rows.length;
-  const share: number[][] = [];
-  const absent: number[] = [];
+  const priors = [];
   for (let k = 1; k <= places; k++) {
     const pr = priorShares(P, k, chartLen);
     const prBin = new Array(NB).fill(0);
@@ -181,23 +196,31 @@ export function fitTable(reads: Read[], task: Task, P: Params): { share: number[
       prN[binOf(r)] += 1;
     }
     for (let b = 0; b < NB; b++) prBin[b] /= prN[b];
-    const sh = new Array(NB).fill(0);
-    let ab = 0;
-    for (const lag of lags) {
-      let b = Math.max(0, Math.floor(lag / P.bucketH));
-      if (b >= nBuckets) b = nBuckets - 1;
-      // fall back to the nearest shorter bucket with data
-      let bb = b;
-      while (bb > 0 && tot[bb] === 0) bb--;
-      const t = tot[bb];
-      const denom = t + P.alpha;
-      for (let x = 0; x < NB; x++) sh[x] += (hit[bb][k - 1][x] + P.alpha * prBin[x]) / denom;
-      ab += (abs[bb][k - 1] + P.alpha * pr.absent) / denom;
-    }
-    share.push(sh.map((v) => v / lags.length));
-    absent.push(ab / lags.length);
+    priors.push({ bin: prBin, absent: pr.absent });
   }
-  return { share, absent };
+  const tables: Table[] = [];
+  for (const lag of lags) {
+    let b = Math.max(0, Math.floor(lag / P.bucketH));
+    if (b >= nBuckets) b = nBuckets - 1;
+    // fall back to the nearest shorter bucket with data
+    while (b > 0 && tot[b] === 0) b--;
+    const denom = tot[b] + P.alpha;
+    const share: number[][] = [];
+    const absent: number[] = [];
+    for (let k = 1; k <= places; k++) {
+      const pr = priors[k - 1];
+      const sh = pr.bin.map((v: number, x: number) => (hit[b][k - 1][x] + P.alpha * v) / denom);
+      const ab = (abs[b][k - 1] + P.alpha * pr.absent) / denom;
+      // scale the unnamed mass, keeping the place's total
+      const named = sh.reduce((a: number, v: number, x: number) => a + v * (BIN_EDGES[x + 1] - BIN_EDGES[x]), 0);
+      const ab2 = Math.min(0.9, ab * P.absMul);
+      const f = named > 0 ? (named + ab - ab2) / named : 1;
+      share.push(sh.map((v: number) => v * f));
+      absent.push(ab2);
+    }
+    tables.push({ lag, share, absent });
+  }
+  return tables;
 }
 
 // rank of each game of the last read at about lookH hours before it (absent: RANK_CAP + 1)
@@ -212,6 +235,30 @@ function pastRanks(reads: Read[], lookH: number): Map<number, number> | null {
   }
   if (!best) return null;
   return new Map(best.rows.map((g) => [g.id, g.rank] as [number, number]));
+}
+
+// playing counts at about lookH hours before the last read
+function pastPlaying(reads: Read[], lookH: number): Map<number, number> | null {
+  const last = reads[reads.length - 1];
+  let best: Read | null = null;
+  for (const r of reads) {
+    if (r === last) continue;
+    const ago = (last.at - r.at) / HOUR;
+    if (ago < lookH * 0.5) continue;
+    if (!best || Math.abs(ago - lookH) < Math.abs((last.at - best.at) / HOUR - lookH)) best = r;
+  }
+  if (!best) return null;
+  const m = new Map<number, number>();
+  for (const g of best.rows) if (g.playing !== null) m.set(g.id, g.playing);
+  return m;
+}
+
+// 1-based rank of each value, highest first; ties keep the input order
+function rankBy(values: number[]): number[] {
+  const idx = values.map((_, i) => i).sort((a, b) => values[b] - values[a] || a - b);
+  const out = new Array(values.length).fill(0);
+  idx.forEach((i, r) => (out[i] = r + 1));
+  return out;
 }
 
 // per-game share at a continuous rank: piecewise-constant bins, linear between bin centres
@@ -249,28 +296,61 @@ export function forecast(reads: Read[], task: Task, P: Params = DEFAULTS): Forec
     for (let s = 0; s < task.slots; s++) if (task.from + s * task.slotMs < exit) n++;
     return n / task.slots;
   });
-  const effRank = games.map((g) => {
-    if (!past) return g.rank;
-    const prev = past.get(g.id) ?? RANK_CAP + 1;
-    const trend = Math.log((prev + 2) / (g.rank + 2));
-    return Math.max(1, g.rank * Math.exp(-P.beta * trend));
+  // rank of each game by its playing count now, and by the growth of it over lookH
+  const byPlay = rankBy(games.map((g) => (g.playing ?? 0)));
+  const pastPlay = pastPlaying(reads, P.lookH);
+  const byGrow = rankBy(
+    games.map((g) => {
+      const before = pastPlay ? pastPlay.get(g.id) : undefined;
+      const now = g.playing ?? 0;
+      return before === undefined ? Math.log1p(now) * 0.5 : Math.log1p(now) - Math.log1p(before);
+    }),
+  );
+  // hours since each game was first seen on the chart (games there from the history's start: its span)
+  const firstSeen = new Map<number, number>();
+  for (const r of reads) for (const g of r.rows) if (!firstSeen.has(g.id)) firstSeen.set(g.id, r.at);
+  // the log-rank each game drifts toward: momentum, playing count, playing growth, chart age
+  const hasPlay = games.some((x) => x.playing !== null);
+  const drift = games.map((g, i) => {
+    let d = 0;
+    if (P.gAge !== 0) {
+      const ageH = (last.at - (firstSeen.get(g.id) ?? last.at)) / HOUR;
+      d += P.gAge * Math.log((ageH + P.ageH0) / (P.ageMid + P.ageH0));
+    }
+    if (past) {
+      const prev = past.get(g.id) ?? RANK_CAP + 1;
+      d -= P.beta * Math.log((prev + 2) / (g.rank + 2));
+    }
+    if (P.gPlay !== 0 && hasPlay) d += P.gPlay * (Math.log(byPlay[i]) - Math.log(g.rank));
+    if (P.gGrow !== 0 && pastPlay) d += P.gGrow * (Math.log(byGrow[i]) - Math.log(g.rank));
+    return Math.min(P.dDown, Math.max(-P.dUp, d));
   });
   const grid: number[][] = [];
   for (let k = 1; k <= task.places; k++) {
-    const sh = table.share[k - 1];
-    const base = games.map((g) => shareAt(sh, g.rank));
-    const baseSum = base.reduce((a, b) => a + b, 0);
-    let w = games.map((g, i) => shareAt(sh, effRank[i]));
-    const wSum = w.reduce((a, b) => a + b, 0);
-    if (wSum > 0) w = w.map((v) => (v * baseSum) / wSum);
-    // games leaving at day 28 give up their mass to everyone else, pro rata
-    const before = w.reduce((a, b) => a + b, 0) + table.absent[k - 1];
-    w = w.map((v, i) => v * alive[i]);
-    const after = w.reduce((a, b) => a + b, 0) + table.absent[k - 1];
-    const scale = after > 0 ? before / after : 1;
-    w = w.map((v) => v * scale);
-    let total = w.reduce((a, b) => a + b, 0);
-    const absent = table.absent[k - 1] * scale;
+    const acc = new Array(games.length).fill(0);
+    let accAbsent = 0;
+    for (let s = 0; s < table.length; s++) {
+      const t = table[s];
+      const sh = t.share[k - 1];
+      // the drift takes hold as the lag grows
+      const f = P.tauH > 0 ? Math.max(0, t.lag) / (Math.max(0, t.lag) + P.tauH) : 1;
+      const base = games.map((g) => shareAt(sh, g.rank));
+      const baseSum = base.reduce((a, b) => a + b, 0);
+      let w = games.map((g, i) => shareAt(sh, Math.max(1, g.rank * Math.exp(f * drift[i]))));
+      const wSum = w.reduce((a, b) => a + b, 0);
+      if (wSum > 0) w = w.map((v) => (v * baseSum) / wSum);
+      // a game past day 28 at this slot is off the chart: its mass goes to everyone else, pro rata
+      const slotAt = task.from + s * task.slotMs;
+      const before = baseSum + t.absent[k - 1];
+      w = w.map((v, i) => (alive[i] < 1 && exitAt(created, games[i].id) <= slotAt ? 0 : v));
+      const after = w.reduce((a, b) => a + b, 0) + t.absent[k - 1];
+      const scale = after > 0 ? before / after : 1;
+      for (let i = 0; i < games.length; i++) acc[i] += w[i] * scale;
+      accAbsent += t.absent[k - 1] * scale;
+    }
+    let w = acc.map((v) => v / table.length);
+    const absent = accAbsent / table.length;
+    const total = w.reduce((a, b) => a + b, 0);
     if (total + absent > 1) w = w.map((v) => v / (total + absent));
     grid.push(w);
     for (let i = 0; i < games.length; i++) {
@@ -291,6 +371,11 @@ export function forecast(reads: Read[], task: Task, P: Params = DEFAULTS): Forec
     }
   }
   return { probabilities, top10: fillTop10(top10) };
+}
+
+function exitAt(created: Map<number, number>, id: number): number {
+  const c = created.get(id);
+  return c === undefined ? Infinity : c + 28 * DAY;
 }
 
 function fillTop10(ids: number[]): number[] {
